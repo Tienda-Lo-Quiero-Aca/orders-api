@@ -1,187 +1,125 @@
-# order-api
+# Order API
 
-API de ordenes de marketplaces construida con NestJS.
+Microservicio interno de **Tienda Lo Quiero Acá** que carga en VBI las ventas de Frávega y muestra las ventas de los marketplaces al panel.
 
-## Local
+Varias veces por día trae las ventas nuevas de Frávega, las da de alta en VBI y las guarda en Madre con el resultado. Después sigue cada venta hasta que Frávega la entrega o la cancela. Cada venta nueva se avisa en un canal de Teams, y las que no se pudieron cargar quedan registradas con el motivo.
 
-### Requisitos
+## Qué hace
 
-- Node.js 20
-- npm
-- acceso de red a marketplace-api y madre-api
-- archivo `.env` con:
+| | |
+|---|---|
+| **Carga de ventas en VBI** | Da de alta en VBI cada venta nueva de Frávega, con el comprador, el producto, el precio y la entrega. |
+| **Seguimiento** | Revisa las ventas abiertas y las cierra cuando Frávega las entrega o las cancela. Completa el número TLQV cuando VBI lo asigna. |
+| **Registro en Madre** | Cada venta queda en Madre con su estado y lo que respondió VBI, para no cargarla dos veces. |
+| **Avisos en Teams** | Publica cada venta nueva en un canal de Teams y marca las que no entraron o entraron con datos incompletos. |
+| **Consultas para el panel** | Devuelve las ventas de Frávega, Megatone y OnCity de un período, para panel.market. |
 
-```env
-MARKETPLACE_API_BASE_URL=<url de marketplace-api>
-MADRE_API_BASE_URL=<url de madre-api>
-# URL completa de VBI (Azure external-sale-create) con ?code=... No commitear el valor.
-# Vacia: el envio a VBI falla y las ordenes quedan FAILED [VBI_ERROR].
-POWERAPPS_API_URL=
-# Flujo de Power Automate que publica en el canal de Teams cada orden nueva guardada en madre
-# (lleva la firma ?sig=... No commitear el valor). Vacia: no se notifica y el resto sigue igual.
-TEAMS_WEBHOOK_URL=
-# Crons (hora de Argentina). Expresion con segundos: "seg min hora dia mes diaSemana".
-# Sin valor usan el horario por defecto; si la expresion es invalida se loguea un error y tambien.
-# Los comentarios van en su propia linea: el .env no admite comentarios al final del valor.
-# Por defecto: cada 2 horas en punto
-ORDERS_SYNC_CRON=0 0 */2 * * *
-# Por defecto: cada hora a los :30
-ORDERS_STATUS_CRON=0 30 * * * *
-# Header x-api-key que exigen los POST /orders/fravega/* (en Swagger: boton Authorize).
-# Las consultas GET (las que usa panel.market) no la piden. Sin valor los POST responden 500.
-# Los crons no la necesitan.
-API_KEY=
-# false: no corre ese cron (los endpoints manuales siguen andando). Sin valor corren.
-ORDERS_SYNC_CRON_ENABLED=false
-ORDERS_STATUS_CRON_ENABLED=false
-# Dias desde la compra en los que el proceso de estados sigue revisando una orden. Sin valor: 60.
-ORDERS_STATUS_MAX_AGE_DAYS=60
+## Cómo funciona
+
+```mermaid
+flowchart TD
+    A([Cron cuatro veces por día<br/>o carga manual]) --> B[Trae de Frávega las ventas<br/>nuevas desde la última carga]
+    B --> C{¿Ya está en Madre?}
+    C -- Sí --> S[Se saltea]
+    C -- No --> D{¿Se pudo leer<br/>la venta en Frávega?}
+    D -- No --> F1[Queda FAILED<br/>SOURCE_ERROR]
+    D -- Sí --> E{¿Está cancelada<br/>o devuelta?}
+    E -- Sí --> X[Queda CANCELLED<br/>no se carga en VBI]
+    E -- No --> G[Se da de alta en VBI]
+    G -- VBI la rechaza --> F2[Queda FAILED<br/>VBI_ERROR]
+    G -- VBI la acepta --> H[Queda PENDING<br/>o COMPLETED si ya se entregó]
+    F1 --> I[Se guarda en Madre<br/>y se avisa en Teams]
+    F2 --> I
+    X --> I
+    H --> I
 ```
 
-### Flujo de ordenes (cron `ORDERS_SYNC_CRON`, por defecto cada 2 horas, o `POST /orders/fravega/sync`)
+El detalle de cada paso está en la [guía funcional](docs/funcional.md).
 
-`persistence_status` en madre sigue el estado de la orden en Fravega: `PENDING` mientras esta abierta,
-`COMPLETED` cuando se entrega y `CANCELLED` cuando se cancela o se devuelve. El resultado de VBI va en
-`notification_system_b_status`, `floxu_code` (numero TLQV), `vbi_sale_id` y `vbi_nro_venta`.
+## Ambientes
 
-1. Trae las ordenes nuevas de Fravega desde marketplace-api (`/fravega/full-orders`), desde el ultimo sync.
-2. Las que ya existen en madre se saltean.
-3. Si ya esta cancelada o devuelta en Fravega no se envia a VBI: queda `CANCELLED` con el detalle en `last_error`.
-4. Ninguna orden se frena por datos del comprador. En `CUITCOMPRADOR` va el CUIL/CUIT; si Fravega no lo trae, el DNI; si tampoco, `no-encontrado`
-   (en madre `customer_document` queda `null`). En `EMAIL` va el email de Seller Central; si falta, `no-encontrado`.
-5. La envia a VBI: si responde `success` (o `duplicate`) queda `PENDING` (o `COMPLETED` si ya fue entregada),
-   con `notification_system_b_status: success`. Si no, `FAILED` con `[VBI_ERROR] ...`.
-6. Las ordenes que marketplace-api no pudo completar (falla VTEX / Seller Central) quedan `FAILED` con `[SOURCE_ERROR] ...`.
-7. Recien ahi la inserta en madre, en un solo batch con el resultado.
+| Ambiente | URL base |
+|---|---|
+| Producción | `https://order.api.loquieroaca.com` |
+| Local | `http://localhost:3000` |
 
-Si VBI la acepto pero madre no la pudo guardar, el sync automatico no avanza su marca y la vuelve a procesar:
-VBI deduplica por `NROVENTA`, responde `duplicate` y se guarda sin crear otra venta.
+Además de los endpoints, el servicio publica dos herramientas:
 
-Requiere la version de madre-api que acepta el resultado en el batch (`vbi_*`, `persistence_status`, `CANCELLED`)
-y pagina `/pending`: con una version anterior madre descarta esos campos y las ordenes quedarian `PENDING` sin datos de VBI.
-Deployar madre-api antes que orders-api.
+| Herramienta | Ruta | Para qué |
+|---|---|---|
+| Documentación | `/docs` | Esta documentación, navegable y con buscador. |
+| Swagger | `/api/docs` | Probar los endpoints desde el navegador (botón **Authorize** para la clave). |
 
-- `POST /orders/fravega/sync?from=...&to=...` reprocesa un rango de fechas de compra a mano.
-  `from` / `to` van en UTC. Seller Central filtra por la hora argentina de la compra (ignora la zona horaria),
-  asi que orders-api le resta 3 horas al rango antes de pedirlo.
-- `POST /orders/fravega/retry/{suborderId}` reintenta una orden `FAILED` (ej. `v93713051frvg-01`).
+## Autenticación
 
-### Estados (cron `ORDERS_STATUS_CRON`, por defecto cada hora a los :30, o `POST /orders/fravega/status-sync`)
+Las consultas (`GET /orders/...`) no piden clave: son las que usa panel.market.
 
-Recorre las ordenes `PENDING` de Fravega en madre (`GET /api/orders/pending`, de a 200), consulta cada una en Fravega y:
+Los procesos (`POST /orders/fravega/...`) piden este header:
 
-- entregada (`Delivered`) → `COMPLETED`;
-- cancelada o devuelta (`Canceled` / `Returned` en Seller Central, o `canceled` en VTEX) → `CANCELLED`
-  con el detalle en `last_error` (`[CANCELLED] ...`);
-- el resto sigue `PENDING`.
+| Header | Valor |
+|---|---|
+| `x-api-key` | La clave del servicio (`API_KEY`). |
 
-En todas actualiza `status` y `delivery_status` si cambiaron en Fravega.
+Sin el header, o con una clave incorrecta, la respuesta es `401 API key invalida o ausente`. Si el servidor no tiene `API_KEY` configurada, todos los procesos responden `500 API key no configurada en el servidor`.
 
-Solo revisa las compradas en los ultimos `ORDERS_STATUS_MAX_AGE_DAYS` dias (60 por defecto): una devolucion puede
-llegar despues de facturar (hasta ~5 semanas despues de la compra), la entrega y los 10 dias de arrepentimiento.
-Las mas viejas quedan `PENDING` sin revisar (en la respuesta, `tooOld`); se ven con `GET /api/orders` de madre.
+## Primer llamado
 
-Ademas completa el numero TLQV (`floxu_code`): VBI lo asigna despues de crear la venta, asi que en el primer
-envio suele venir vacio. A las ordenes `PENDING` con `notification_system_b_status: success` y sin `floxu_code`
-(salvo las canceladas) las reenvia a VBI: como VBI deduplica por `NROVENTA` responde `duplicate` con el numero,
-sin crear otra venta.
+Las consultas son de solo lectura y no cambian nada. Es la forma segura de empezar:
 
-Sync, retry y estados no corren en paralelo: si uno esta en curso, el otro responde 409 (o el cron se omite).
+```bash
+curl -s "https://order.api.loquieroaca.com/orders/overview/last-24-hours"
+```
 
-### Levantar en desarrollo
+Devuelve las ventas de las últimas 24 horas de los tres marketplaces, con un total por marketplace.
+
+Los procesos, en cambio, **dan de alta ventas reales en VBI**. Ver [Referencia de la API](docs/api.md) antes de llamarlos.
+
+## Documentación
+
+**Órdenes**
+
+| Documento | Qué explica |
+|---|---|
+| [Guía funcional](docs/funcional.md) | Cómo se carga una venta de Frávega en VBI: de dónde sale cada dato, qué se manda, estados, seguimiento, número TLQV, avisos en Teams y consultas del panel. |
+| [Bloqueos](docs/bloqueos.md) | Motivos por los que una venta no entra a VBI o entra incompleta, qué significa cada uno y qué hacer. |
+
+**API**
+
+| Documento | Qué explica |
+|---|---|
+| [Referencia de la API](docs/api.md) | Todos los endpoints: consultas para el panel y procesos de Frávega, con parámetros, ejemplos, respuestas y errores. |
+
+**Técnico**
+
+| Documento | Qué explica |
+|---|---|
+| [Arquitectura y configuración](docs/tecnico.md) | Capas del código, integraciones, crons, la ventana de cada carga, variables de entorno, tests y limitaciones conocidas. |
+| [Operación](docs/operacion.md) | Dónde corre, deploy, credenciales, cómo verificar que está sano y qué hacer ante los problemas más frecuentes. |
+
+## Desarrollo local
+
+Requisitos: Node.js 20 y acceso de red a marketplace-api y Madre.
 
 ```bash
 npm install
-npm run start:dev
+# crear .env con las variables de docs/tecnico.md (Variables de entorno)
+npm run start:dev       # http://localhost:3000
 ```
 
-La API queda en:
-
-- `http://localhost:3000`
-- `http://localhost:3000/docs`
-
-### Validaciones utiles
+> **Cuidado con los crons en local.** Si `ORDERS_SYNC_CRON_ENABLED` y `ORDERS_STATUS_CRON_ENABLED` no están en `false`, los crons corren solos. Con `POWERAPPS_API_URL` cargada, eso da de alta ventas reales en VBI y escribe en Madre. En local conviene dejarlos en `false` y dejar `POWERAPPS_API_URL` vacía salvo que se quiera probar la carga.
 
 ```bash
-npm run lint
-npm test -- --runInBand
-npm run build
+npm test                # tests unitarios
+npm run lint            # eslint con --fix
+npm run build           # compila a dist/
 ```
 
-### Docker local
+Para ver la documentación como sitio, sin levantar el resto del servicio:
 
 ```bash
-docker compose up --build
+npm run docs:preview    # http://localhost:4310/docs
 ```
 
-## Kubernetes
+## Stack
 
-Los manifests viven en `k8s/`.
-
-`POWERAPPS_API_URL` (lleva la clave de Azure, `?code=...`), `TEAMS_WEBHOOK_URL` (lleva la firma `sig=...`) y `API_KEY` no van en `config.yaml` sino en el Secret
-`order-api-secrets`, que se crea una vez a mano en el cluster (no esta en el repo):
-
-```bash
-kubectl create secret generic order-api-secrets \
-  --from-literal=POWERAPPS_API_URL='https://...azurewebsites.net/api/external-sale-create?code=...' \
-  --from-literal=API_KEY='...' \
-  --from-literal=TEAMS_WEBHOOK_URL='https://...powerplatform.com/powerautomate/...&sig=...'
-kubectl rollout restart deployment/order-api   # para que el pod tome el valor
-```
-
-Mientras no exista, el pod arranca igual pero el envio a VBI falla (las ordenes quedan `FAILED [VBI_ERROR]`)
-y los POST `/orders/fravega/*` responden 500. Los GET no usan la key.
-
-Aplicacion manual:
-
-```bash
-kubectl apply -f k8s/config.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-kubectl apply -f k8s/ingress.yaml
-```
-
-## Deploy automatico a produccion
-
-El repo queda preparado para deployar al hacer merge a `main` usando GitHub Actions:
-
-1. Build multi-arch para `linux/amd64`
-2. Push a DigitalOcean Container Registry
-3. Actualizacion del `Deployment` en DOKS con la imagen taggeada por commit
-4. Espera del rollout
-
-### Secretos necesarios en GitHub
-
-Configuralos en `Settings > Secrets and variables > Actions`:
-
-- `DIGITALOCEAN_ACCESS_TOKEN`
-- `DOCR_REGISTRY_NAME`
-- `DO_KUBERNETES_CLUSTER_NAME`
-
-### Requisitos de infraestructura
-
-Antes de usar el workflow, el cluster debe estar integrado con el registry de DigitalOcean.
-
-Segun la documentacion oficial de DigitalOcean, eso se puede hacer con:
-
-```bash
-doctl kubernetes cluster registry add <cluster-name>
-```
-
-Documentacion usada:
-
-- [Enable Push-to-Deploy on DigitalOcean Kubernetes Using GitHub Actions](https://docs.digitalocean.com/products/container-registry/how-to/enable-push-to-deploy/)
-- [How to Use Your Private DigitalOcean Container Registry with Docker and Kubernetes](https://docs.digitalocean.com/products/container-registry/how-to/use-registry-docker-kubernetes/)
-
-### Lens
-
-Los recursos de Kubernetes tienen labels `app.kubernetes.io/*` para que se vean mas ordenados en Lens:
-
-- `app.kubernetes.io/name=order-api`
-- `app.kubernetes.io/component=api`
-- `app.kubernetes.io/part-of=order-api`
-
-## Notas
-
-- El workflow no aplica `k8s/cluster-issuer.yaml` en cada deploy porque es un recurso cluster-wide y conviene manejarlo aparte.
-- El `Deployment` usa un placeholder `<IMAGE>` que el workflow reemplaza con la imagen exacta del commit antes de aplicar.
+NestJS 11 · TypeScript · `@nestjs/schedule` para los crons · `fetch` de Node · Jest. Corre en Kubernetes (DigitalOcean) y se deploya solo al mergear a `main`.
