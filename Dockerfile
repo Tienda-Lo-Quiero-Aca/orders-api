@@ -16,6 +16,9 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
+# El sitio /docs lee estos archivos del directorio de trabajo en cada visita
+COPY README.md ./
+COPY docs ./docs
 
 ENV NODE_ENV=production
 ENV PORT=3000

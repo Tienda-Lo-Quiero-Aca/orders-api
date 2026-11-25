@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - 'src/**'
+      # El sitio /docs sale de la imagen: un cambio de texto tambien se deploya
+      - 'README.md'
+      - 'docs/**'
       - 'k8s/**'
       - 'Dockerfile'
       - 'package.json'
